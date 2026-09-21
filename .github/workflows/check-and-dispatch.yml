@@ -1,0 +1,162 @@
+name: Check Upstream Tags and Trigger Build
+
+on:
+  schedule:
+    - cron: "0 13 * * *" # UTC 13:00 daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  check-tags:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://api.github.com/repos/dotnet/dotnet/tags?per_page=100 |
+            jq -r '.[].name' > upstream-tags.txt
+
+          git fetch --tags
+
+          git tag > local-tags.txt
+
+      - name: Upload tag lists
+        uses: actions/upload-artifact@v6
+        with:
+          name: tags-${{ github.run_id }}
+          path: |
+            upstream-tags.txt
+            local-tags.txt
+          retention-days: 30
+
+      - name: Determine builds
+        id: builds
+        run: |
+          dotnet run -c Release - -- upstream-tags.txt local-tags.txt <<'EOF'
+          #:package NuGet.Versioning@*
+
+          using NuGet.Versioning;
+          using System.Text.Json;
+          using System.Text.Json.Serialization;
+
+          var upstreamTags = File.ReadAllLines(args[0]);
+          var localTags = File.ReadAllLines(args[1]);
+
+          static string Normalize(string tag)
+          {
+              // If it's a failed variant, strip the trailing .<run_id>.failed to get the original tag name
+              if (tag.EndsWith(".failed", StringComparison.OrdinalIgnoreCase))
+              {
+                  // Remove ".failed"
+                  tag = tag.Substring(0, tag.Length - 7);
+                  // Remove the trailing dot and run_id (e.g., .123456789)
+                  int lastDot = tag.LastIndexOf('.');
+                  if (lastDot > 0)
+                  {
+                      tag = tag.Substring(0, lastDot);
+                  }
+              }
+
+              tag = tag.TrimStart('v');
+
+              if (NuGetVersion.TryParse(tag, out var version))
+              {
+                  if (version.IsPrerelease)
+                  {
+                      var first = version.ReleaseLabels.First();
+                      var second = version.ReleaseLabels.Skip(1).FirstOrDefault();
+
+                      if ((first == "preview" || first == "rc") && second != null)
+                          return $"{version.Major}.{version.Minor}.{version.Patch}-{first}.{second}";
+                  }
+
+                  return version.ToNormalizedString();
+              }
+
+              return tag;
+          }
+
+          var built = localTags
+              .Select(Normalize)
+              .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+          var builds = new List<BuildItem>();
+
+          foreach (var raw in upstreamTags)
+          {
+              if (!NuGetVersion.TryParse(raw.TrimStart('v'), out var version))
+                  continue;
+
+              if (version.Major < 11)
+                  continue;
+
+              if (version.Minor != 0)
+                  continue;
+
+              if (version.Patch < 100 || version.Patch >= 200)
+                  continue;
+
+              if (version.IsPrerelease)
+              {
+                  var label = version.ReleaseLabels.FirstOrDefault();
+
+                  if (label is not ("preview" or "rc"))
+                      continue;
+              }
+
+              var normalized = Normalize(raw);
+
+              if (built.Contains(normalized))
+                  continue;
+
+              // Brand each tag the way the official build did: previews/RCs dated, GA/servicing stabilized.
+              builds.Add(new BuildItem(raw, version.IsPrerelease ? "repodefault" : "release"));
+          }
+
+          string json = JsonSerializer.Serialize(builds, BuildItemContext.Default.ListBuildItem);
+          File.WriteAllText("/tmp/tags.json", json);
+
+          public record BuildItem(string tag, string branding);
+
+          [JsonSerializable(typeof(List<BuildItem>))]
+          internal partial class BuildItemContext : JsonSerializerContext { }
+          EOF
+
+          jq . /tmp/tags.json
+
+          count=$(jq length /tmp/tags.json)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger builds
+        if: steps.builds.outputs.count != '0'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          jq -c '.[]' /tmp/tags.json |
+          while read -r build; do
+            tag=$(jq -r '.tag' <<<"$build")
+            branding=$(jq -r '.branding' <<<"$build")
+
+            echo "Dispatching $tag (branding: $branding)"
+
+            gh workflow run build.yml \
+              --ref main \
+              -f fork=dotnet \
+              -f branch="$tag" \
+              -f branding="$branding" \
+              -f release=true
+
+            sleep 5
+          done
