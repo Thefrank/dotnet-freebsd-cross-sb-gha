@@ -98,9 +98,9 @@ jobs:
         find "${{ github.workspace }}/dotnet/artifacts"
 
     - name: Upload .NET
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v4
       with:
-        name: dotnet-sdk-${{ matrix.name }}
+        name: dotnet-sdk-${{ matrix.name }}-${{ matrix.arch }}
         path: |
           ${{ github.workspace }}/dotnet/artifacts/assets/Release/Sdk/*/dotnet-sdk-*.tar.gz
 
@@ -133,13 +133,22 @@ jobs:
           sdk_filename=$(basename "$sdk_path")
           sdk_version=$(echo "$sdk_filename" | sed -E 's/dotnet-sdk-([^-]+(-[^-]+)*)-.+\.tar\.gz/\1/')
           artifacts="$artifacts $sdk_path"
-          tag_name="$sdk_version"
+
+          # All architectures must have the same SDK version.
+          if [ -z "$tag_name" ]; then
+            tag_name="$sdk_version"
+          elif [ "$tag_name" != "$sdk_version" ]; then
+            echo "ERROR: SDK version mismatch:"
+            echo "  Existing: $tag_name"
+            echo "  Found:    $sdk_version"
+            exit 1
+          fi
         done
 
         echo "tag_name: $tag_name"
         echo "artifacts: $artifacts"
 
-        # A pre-release suffix in the SDK version marks a GitHub pre-release (e.g, "-rc")
+        # A pre-release suffix in the SDK version (e.g. 11.0.100-rc.1.26425.128) marks a GitHub pre-release.
         if [[ "$tag_name" == *-* ]]; then
           gh release create "$tag_name" $artifacts \
             --repo "${{ github.repository }}" \
