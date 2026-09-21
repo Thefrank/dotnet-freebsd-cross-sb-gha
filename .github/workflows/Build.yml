@@ -1,0 +1,157 @@
+name: Build .NET SDK
+
+run-name: "Build .NET SDK : ${{ inputs.branch }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork:
+        description: 'dotnet VMR fork name'
+        required: true
+        type: string
+        default: dotnet
+      branch:
+        description: 'dotnet VMR branch name'
+        required: true
+        type: string
+        default: main
+      branding:
+        description: 'SDK branding'
+        required: true
+        type: choice
+        options:
+          - repodefault
+          - unstable
+          - preview
+          - release
+        default: repodefault
+      release:
+        description: 'publish release'
+        type: boolean
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - name: freebsd
+            arch: x64
+            docker_tag: azurelinux-3.0-net11.0-cross-freebsd-14-amd64
+          - name: freebsd
+            arch: arm64
+            docker_tag: azurelinux-3.0-net11.0-cross-freebsd-14-arm64
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Maximize build space
+      uses: AdityaGarg8/remove-unwanted-software@v5
+      with:
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-cached-tools: 'true'
+
+    - name: Clone repository
+      run: |
+        git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet
+
+    - name: Build
+      run: |
+        ref="${{ inputs.branch }}"
+        version="${ref#v}"
+        major_version=$(echo "$version" | sed -E 's/^([0-9]+)\..*/\1/')
+
+        # Branding is only supported from .NET 11 on. 'repodefault' lets the tag/branch decide, like the official build.
+        branding_arg=""
+        if [ "${{ inputs.branding }}" != "repodefault" ] && [[ "$major_version" =~ ^[0-9]+$ ]] && [ "$major_version" -ge 11 ]; then
+          branding_arg="--branding ${{ inputs.branding }}"
+        fi
+
+        # Dated tags rebuild under their own version. Arcade short date is (yy * 1000) + (mm * 50) + dd, rev has the VMR's +100.
+        official_build_id="$(date +%Y%m%d).99"
+        if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+\.[0-9]+)?\.([0-9]{5})\.([0-9]{3})$ ]]; then
+          short_date="${BASH_REMATCH[2]}"
+          rev="${BASH_REMATCH[3]}"
+          yy=$((10#$short_date / 1000))
+          rem=$((10#$short_date % 1000))
+          mm=$((rem / 50))
+          dd=$((rem % 50))
+          official_build_id="$(printf '20%02d%02d%02d.%d' "$yy" "$mm" "$dd" $((10#$rev - 100)))"
+        fi
+
+        echo "Major version: $major_version"
+        echo "Branding argument: ${branding_arg:-<none, VMR default>}"
+        echo "OfficialBuildId: $official_build_id"
+
+        docker run --platform linux/amd64 --rm -v${{ github.workspace }}/dotnet:/dotnet -w /dotnet -e ROOTFS_DIR=/crossrootfs/${{ matrix.arch }} \
+          mcr.microsoft.com/dotnet-buildtools/prereqs:${{ matrix.docker_tag }} \
+            ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-${{ matrix.arch }} --arch ${{ matrix.arch }} \
+              $branding_arg -p:OfficialBuildId=$official_build_id -p:SkipUsingCrossgen=true -p:BundleCrossgen2=true -p:KeepNativeSymbols=false
+
+    - name: List assets directory
+      run: |
+        find "${{ github.workspace }}/dotnet/artifacts"
+
+    - name: Upload .NET
+      uses: actions/upload-artifact@v6
+      with:
+        name: dotnet-sdk-${{ matrix.name }}
+        path: |
+          ${{ github.workspace }}/dotnet/artifacts/assets/Release/Sdk/*/dotnet-sdk-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always() && inputs.release
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download artifacts
+      if: needs.build.result == 'success'
+      uses: actions/download-artifact@v6
+      with:
+        path: artifacts
+
+    - name: Make release (Success)
+      if: needs.build.result == 'success'
+      run: |
+        sdk_paths=$(find "${{ github.workspace }}/artifacts" -name 'dotnet-sdk-*.tar.gz')
+
+        artifacts=""
+        tag_name=""
+
+        for sdk_path in $sdk_paths; do
+          sdk_filename=$(basename "$sdk_path")
+          sdk_version=$(echo "$sdk_filename" | sed -E 's/dotnet-sdk-([^-]+(-[^-]+)*)-"${{ matrix.name }}"-.+\.tar\.gz/\1/')
+          artifacts="$artifacts $sdk_path"
+          tag_name="$sdk_version"
+        done
+
+        echo "tag_name: $tag_name"
+        echo "artifacts: $artifacts"
+
+        # A pre-release suffix in the SDK version (e.g. 11.0.100-rc.1.26425.128) marks a GitHub pre-release.
+        if [[ "$tag_name" == *-* ]]; then
+          gh release create "$tag_name" $artifacts --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "$tag_name" --notes "$tag_name" --prerelease
+        else
+          gh release create "$tag_name" $artifacts --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "$tag_name" --notes "$tag_name"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create failed tag
+      if: needs.build.result == 'failure' && inputs.branch != 'main'
+      run: |
+        tag_name="${{ inputs.branch }}.${{ github.run_id }}.failed"
+        echo "tag_name: $tag_name"
+
+        gh api repos/${{ github.repository }}/git/refs -f ref="refs/tags/$tag_name" -f sha="${{ github.sha }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
