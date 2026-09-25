@@ -8,7 +8,9 @@ Works for NET10 after changing tag logic and container.
 
 Does no additional patching. FreeBSD Ports version has some extra [patches](https://github.com/freebsd/freebsd-ports/tree/main/lang/dotnet/files)
 
-This is all done automagically. Checks for new tags daily. Failed builds/tags are rerun every day. 
+This is all done automagically. Checks for new tags daily.
+
+Failed builds/tags can be rerun by deleting the `failed` tag. 
 
 If you want the the SDK from FreeBSD Ports use `pkg install dotnet`. This is easiest way of using the SDK.
 
